@@ -257,6 +257,35 @@ static void descriptor_tests(void)
     ++tests_run;
 }
 
+static void automatic_backup_tests(void)
+{
+    char directory[] = "/tmp/m720-auto-XXXXXX";
+    assert(mkdtemp(directory) != NULL);
+    struct mouse home = test_mouse(), office = test_mouse();
+    memcpy(home.original.action, playpause, 4);
+    home.original.status = 1;
+    office.identity[0] = 'c';
+    char home_path[PATH_MAX], office_path[PATH_MAX], channel_path[PATH_MAX];
+    assert(automatic_backup(&home, directory, home_path) == 0);
+    struct mapping saved;
+    assert(load_backup(&home, home_path, &saved) == 0 && same_mapping(&saved, &original));
+    assert(automatic_backup(&office, directory, office_path) == 0);
+    assert(strcmp(home_path, office_path) != 0);
+    assert(load_backup(&office, office_path, &saved) == 0 && same_mapping(&saved, &original));
+    ++office.host;
+    assert(automatic_backup(&office, directory, channel_path) == 0);
+    assert(strcmp(channel_path, office_path) != 0);
+    --office.host;
+    office.original = custom;
+    assert(automatic_backup(&office, directory, office_path) < 0);
+    assert(automatic_backup(&home, directory, home_path) == 0);
+    assert(load_backup(&home, home_path, &saved) == 0 && same_mapping(&saved, &original));
+    assert(unlink(home_path) == 0 && unlink(office_path) == 0 && unlink(channel_path) == 0);
+    assert(rmdir(directory) == 0);
+    puts("PASS: automatic backups isolate two mice/channels, import originals, remain idempotent and protect later changes");
+    ++tests_run;
+}
+
 int main(void)
 {
     strcpy(test_directory, "/tmp/m720-tests-XXXXXX");
@@ -298,6 +327,9 @@ int main(void)
     struct mouse m = test_mouse();
     struct mapping saved;
     assert(load_backup(&m, "original.m720-backup", &saved) == 0 && same_mapping(&saved, &original));
+    assert(unlink("custom.m720-backup") == 0);
+    assert(unlink("apply-custom.m720-backup") == 0);
+    automatic_backup_tests();
     glob_t files = { 0 };
     assert(glob("*.m720-backup", 0, NULL, &files) == 0);
     for (size_t i = 0; i < files.gl_pathc; ++i)

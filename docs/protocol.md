@@ -44,6 +44,20 @@ private. Restore uses function 5 for a firmware default, or function 4 for a sav
 custom action, and verifies the result. It refuses to overwrite unrelated later
 changes. Migration from an earlier `0xe8` assignment reuses the original backup.
 
+## Automated desktop setup
+
+The default `setup` command elevates through the installed `sudo`, then runs the
+mouse operation with device access. Backups use the Bluetooth identity and host
+channel in a root-private `/var/lib/m720-playpause` directory. Existing matching
+backups in the current directory are imported; different mice never share a file.
+
+`desktop.c` invokes `/usr/bin/gsettings` directly without a shell, after dropping
+privileges to the invoking desktop user. It preserves other Play/Pause shortcuts
+and the separate `play-static` media-key setting. The shared `0xca` binding is
+briefly removed and re-added to refresh a stale GNOME grab after device changes.
+Setup is serialized, saves the original desktop setting once per user, verifies
+the result, and attempts to restore it on failure. No process remains running.
+
 ## References
 
 - [Logitech IRoot specification](https://github.com/Logitech/cpg-docs/blob/master/hidpp20/features/0x0000-IRoot.rst)

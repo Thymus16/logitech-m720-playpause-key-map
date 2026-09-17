@@ -2,6 +2,8 @@
 /media-check
 /tests/test
 /tests/test-sanitize
+/tests/test-desktop
+/tests/test-desktop-sanitize
 *.o
 *.m720-backup
 *.gnome-play-backup

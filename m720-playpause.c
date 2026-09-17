@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "desktop.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <glob.h>
@@ -417,6 +418,86 @@ static int load_backup(const struct mouse *m, const char *path, struct mapping *
     return decode_backup(m, data, saved);
 }
 
+static bool tool_mapping(const struct mapping *mapping)
+{
+    return memcmp(mapping->action, playpause, 4) == 0 ||
+           memcmp(mapping->action, legacy_playpause, 4) == 0;
+}
+
+static int import_candidate(const struct mouse *m, const char *path, struct mapping *saved)
+{
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) return 1;
+    struct stat st;
+    uint8_t data[BACKUP_SIZE];
+    bool valid = fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == BACKUP_SIZE &&
+                 read(fd, data, sizeof(data)) == BACKUP_SIZE;
+    close(fd);
+    if (!valid || memcmp(data + 8, m->identity, 18) != 0 || data[26] != m->host)
+        return 1;
+    if (decode_backup(m, data, saved) < 0)
+        return -1;
+    return tool_mapping(saved) ? 1 : 0;
+}
+
+static int automatic_backup(struct mouse *m, const char *directory, char path[PATH_MAX])
+{
+    char identity[18];
+    memcpy(identity, m->identity, sizeof(identity));
+    for (size_t i = 0; i < 17; ++i)
+        if (identity[i] == ':') identity[i] = '-';
+    int length = snprintf(path, PATH_MAX, "%s/mouse-%s-channel-%u.m720-backup",
+                          directory, identity, m->host + 1u);
+    if (length < 0 || length >= PATH_MAX)
+        return fail("automatic backup path too long");
+    struct mapping saved;
+    struct stat st;
+    if (lstat(path, &st) == 0) {
+        if (load_backup(m, path, &saved) < 0)
+            return -1;
+        if (!tool_mapping(&m->original) && !same_mapping(&saved, &m->original))
+            return fail("mouse mapping differs from its saved original; refusing to overwrite another change");
+        printf("Using original backup: %s\n", path);
+        return 0;
+    }
+    if (errno != ENOENT)
+        return system_error("inspect automatic backup path");
+    glob_t files = { 0 };
+    int result = glob("*.m720-backup", 0, NULL, &files);
+    if (result != 0 && result != GLOB_NOMATCH) {
+        globfree(&files);
+        return fail("cannot search for existing mouse backups");
+    }
+    bool found = false;
+    if (files.gl_pathc > 128) {
+        globfree(&files);
+        return fail("too many backup candidates in the current directory");
+    }
+    for (size_t i = 0; i < files.gl_pathc; ++i) {
+        struct mapping candidate;
+        int status = import_candidate(m, files.gl_pathv[i], &candidate);
+        if (status < 0 || (status == 0 && found && !same_mapping(&saved, &candidate))) {
+            globfree(&files);
+            return fail("damaged or conflicting original backups; specify a backup explicitly");
+        }
+        if (status == 0) { saved = candidate; found = true; }
+    }
+    globfree(&files);
+    if (!found && tool_mapping(&m->original)) {
+        if (memcmp(m->original.action, legacy_playpause, 4) == 0)
+            return fail("legacy mapping requires the original backup; run setup from its directory");
+        puts("Already mapped to F24. Original backup not found here; existing backups are unchanged.");
+        return 0;
+    }
+    if (found && !tool_mapping(&m->original) && !same_mapping(&saved, &m->original))
+        return fail("existing backup differs from current mouse mapping; refusing to overwrite another change");
+    struct mouse snapshot = *m;
+    if (found) snapshot.original = saved;
+    if (save_backup(&snapshot, path) < 0)
+        return -1;
+    return 0;
+}
+
 static int change_mapping(struct mouse *m, const struct mapping *target)
 {
     uint8_t host, reply[PAYLOAD_SIZE];
@@ -553,16 +634,44 @@ static int open_mouse(struct mouse *m, const char *path)
     return 0;
 }
 
+int setup_mouse(const char *device, const char *state_directory)
+{
+    char discovered[PATH_MAX], backup[PATH_MAX];
+    if (device == NULL) {
+        if (discover(discovered) < 0) return -1;
+        device = discovered;
+    }
+    struct mouse m = { .fd = -1 };
+    int result = open_mouse(&m, device);
+    if (result == 0) result = inspect(&m);
+    if (result == 0 && !m.supports_f24)
+        result = fail("HID descriptor does not advertise F24; no mapping written");
+    if (result == 0) result = automatic_backup(&m, state_directory, backup);
+    if (result == 0) {
+        if (memcmp(m.original.action, playpause, 4) == 0) {
+            puts("Mouse already mapped correctly; no device write needed.");
+        } else {
+            struct mapping target = { .status = 1 };
+            memcpy(target.action, playpause, 4);
+            result = change_mapping(&m, &target);
+        }
+    }
+    if (m.fd >= 0) close(m.fd);
+    return result;
+}
+
 static void usage(void)
 {
-    puts("Usage: m720-playpause [inspect|apply|restore] [--device /dev/hidrawN]\n"
+    puts("Usage: m720-playpause [setup|inspect|apply|restore] [--device /dev/hidrawN]\n"
          "                     [--backup PATH]\n\n"
-         "inspect  Read capabilities and thumb mapping (default; no settings changed).\n"
+         "setup    Configure the connected mouse and refresh GNOME Play/Pause (default).\n"
+         "inspect  Read capabilities and thumb mapping; no settings changed.\n"
          "apply    Save a NEW backup, then persistently map the hidden thumb button to F24.\n"
          "restore  Restore the mapping from that backup for this mouse and channel.\n\n"
          "apply and restore require --backup PATH. Bluetooth M720 only.\n"
          "Targets thumb CID 0x00d0, not the scroll-wheel/middle button.\n"
-         "Bind F24 to your desktop's Play/Pause action separately.\n"
+         "Setup requests sudo and keeps per-mouse/channel backups in /var/lib/m720-playpause.\n"
+         "Setup preserves other GNOME shortcuts and the keyboard media bindings.\n"
          "Migrating the old 0xe8 mapping reuses its existing original backup.\n"
          "Close Solaar, LogiOps, and other device configuration tools first.\n"
          "No installation, daemon, network access, or downloaded dependencies.");
@@ -570,7 +679,7 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
-    const char *command = "inspect", *backup = NULL, *device = NULL;
+    const char *command = "setup", *backup = NULL, *device = NULL;
     int index = 1;
     if (argc == 2 && strcmp(argv[1], "--help") == 0) {
         usage();
@@ -578,7 +687,8 @@ int main(int argc, char **argv)
     }
     if (index < argc && argv[index][0] != '-')
         command = argv[index++];
-    if (strcmp(command, "inspect") != 0 && strcmp(command, "apply") != 0 && strcmp(command, "restore") != 0) {
+    if (strcmp(command, "setup") != 0 && strcmp(command, "inspect") != 0 &&
+        strcmp(command, "apply") != 0 && strcmp(command, "restore") != 0) {
         usage();
         return EXIT_FAILURE;
     }
@@ -593,11 +703,13 @@ int main(int argc, char **argv)
         }
         ++index;
     }
-    if ((strcmp(command, "inspect") != 0 && (backup == NULL || *backup == '\0')) ||
-        (strcmp(command, "inspect") == 0 && backup != NULL)) {
+    bool mutation = strcmp(command, "apply") == 0 || strcmp(command, "restore") == 0;
+    if ((mutation && (backup == NULL || *backup == '\0')) || (!mutation && backup != NULL)) {
         usage();
         return EXIT_FAILURE;
     }
+    if (strcmp(command, "setup") == 0)
+        return desktop_setup(device) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     char discovered[PATH_MAX];
     if (device == NULL) {
         if (discover(discovered) < 0)
